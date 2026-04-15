@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+.env
+
+# OS junk
+.DS_Store
+Icon?
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.app
+
+# Spotify / auth tokens
+token.cache
+
+# User-specific data
+config/user_spotify.json
+memory/user_prefs.json
