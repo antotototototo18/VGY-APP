@@ -5,6 +5,7 @@ from PySide6.QtGui import QTextOption
 import sys
 import os
 import math
+import time
 from typing import Callable
 
 # ==========================================================
@@ -44,7 +45,7 @@ ENV_USED = _load_project_env()
 # QT / APP IMPORTS
 # ==========================================================
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui import (
     QPainter,
     QColor,
@@ -54,6 +55,9 @@ from PySide6.QtGui import (
     QFontDatabase,
     QFont,
     QPainterPath,
+    QLinearGradient,
+    QRadialGradient,
+    QBrush,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -68,6 +72,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QComboBox,
     QPlainTextEdit,
+    QGridLayout,
+    QListView,
 )
 
 # ==========================================================
@@ -81,6 +87,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 LOGO_PATH = resource_path("assets", "vignity_logo.png")
+# QSS url() wants forward slashes
+CHEVRON_DOWN = Path(resource_path("assets", "icons", "chevron-down.svg")).as_posix()
+CHEVRON_UP = Path(resource_path("assets", "icons", "chevron-up.svg")).as_posix()
+FIELD_LABEL_WIDTH = 150
+FIELD_WIDTH = 180
 
 # ==========================================================
 # INTERNAL MODULES
@@ -211,6 +222,21 @@ class CosmosConsole(QPlainTextEdit):
                 selection-background-color: #135d4f;
                 font-size: 11px;
             }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 6px;
+                margin: 4px 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(120,255,200,60);
+                min-height: 24px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
             """
         )
         self.setFont(QFont("IBM Plex Mono", 10))
@@ -225,10 +251,13 @@ class CosmosConsole(QPlainTextEdit):
         self._typing_timer.setInterval(26)
         self._typing_timer.timeout.connect(self._type_step)
 
-        # Wave animation
-        self._phase = 0
+        # Wave animation (time-based so speed doesn't depend on timer jitter)
+        self._t0 = time.monotonic()
+        self._t = 0.0
+        self._active = False
+        self._energy = 0.0  # eases toward 1 while a job runs, back to 0 after
         self._wave_timer = QTimer(self)
-        self._wave_timer.setInterval(60)
+        self._wave_timer.setInterval(33)
         self._wave_timer.timeout.connect(self._advance_wave)
         self._wave_timer.start()
 
@@ -260,30 +289,147 @@ class CosmosConsole(QPlainTextEdit):
             self._current = ""
             self._start_next()
 
+    def set_active(self, active: bool):
+        self._active = active
+
     def _advance_wave(self):
-        self._phase += 0.25
+        self._t = time.monotonic() - self._t0
+        target = 1.0 if self._active else 0.0
+        self._energy += (target - self._energy) * 0.06
         self.viewport().update()
+
+    # -- ECG model ----------------------------------------------------------
+    _IDLE_BPM, _ACTIVE_BPM = 72, 128
+    _BEATS_ON_SCREEN = 4
+    _AXIS_MAX = 10
+
+    @staticmethod
+    def _ecg(phase: float) -> float:
+        """One PQRST complex in axis units (-10..+10) for a beat phase in [0, 1)."""
+        g = lambda c, w, a: a * math.exp(-(((phase - c) / w) ** 2))
+        return (
+            g(0.14, 0.025, 1.6)     # P
+            + g(0.24, 0.011, -1.8)  # Q
+            + g(0.265, 0.012, 10.0)  # R
+            + g(0.292, 0.012, -10.0)  # S
+            + g(0.48, 0.05, 2.8)     # T
+        )
 
     def paintEvent(self, event):
         super().paintEvent(event)
         p = QPainter(self.viewport())
         p.setRenderHint(QPainter.Antialiasing)
 
-        color = QColor(0, 255, 180, 28)
-        pen = QPen(color, 1.4)
-        p.setPen(pen)
-
         w, h = self.viewport().width(), self.viewport().height()
-        mid = h * 0.5
+        if w < 80 or h < 80:
+            return
 
-        path = QPainterPath()
-        path.moveTo(0, mid)
+        axis_w = 30
+        left, right = axis_w + 10, w - 16
+        plot_w = right - left
+        mid = h * 0.56
+        scale = (h * 0.26) / self._AXIS_MAX
+        to_y = lambda v: mid - v * scale
+        teal = lambda a: QColor(0, 255, 180, max(0, min(255, int(a))))
 
-        for x in range(0, w, 12):
-            y = mid + math.sin((x / 30) + self._phase) * (h * 0.16)
-            path.lineTo(x, y)
+        # Axis: quiet labels + short ticks, dashed baseline
+        p.setFont(QFont("IBM Plex Mono", 8))
+        for v in (10, 5, 0, -5, -10):
+            y = to_y(v)
+            p.setPen(teal(55 if v in (10, 0, -10) else 30))
+            p.drawText(QRectF(0, y - 7, axis_w, 14), Qt.AlignRight | Qt.AlignVCenter, f"{v:+d}" if v else "0")
+            p.setPen(QPen(teal(45), 1))
+            p.drawLine(QPointF(left - 5, y), QPointF(left - 1, y))
+        base = QPen(teal(22), 1, Qt.CustomDashLine)
+        base.setDashPattern([2, 6])
+        p.setPen(base)
+        p.drawLine(QPointF(left, mid), QPointF(right, mid))
 
-        p.drawPath(path)
+        # Sweep geometry
+        e = self._energy
+        bpm = self._IDLE_BPM + (self._ACTIVE_BPM - self._IDLE_BPM) * e
+        beat_s = 60.0 / bpm
+        speed = plot_w / (self._BEATS_ON_SCREEN * beat_s)
+        t = self._t
+        pen_x = (t * speed) % plot_w
+        gap = 26
+
+        def y_at(x: float) -> float:
+            age = ((pen_x - x) % plot_w) / speed
+            return to_y(self._ecg(((t - age) / beat_s) % 1.0))
+
+        def stroke_parts():
+            # (x_from, x_to, age_at_from, age_at_to) — age is linear in x, so a
+            # horizontal gradient reproduces the phosphor fade exactly
+            sweep_s = plot_w / speed
+            parts = [(0.0, pen_x, pen_x / speed, 0.0)]
+            if pen_x + gap < plot_w:
+                parts.append((pen_x + gap, plot_w, (plot_w - gap) / speed, pen_x / speed))
+            return parts, sweep_s
+
+        parts, sweep_s = stroke_parts()
+        for x0, x1, age0, age1 in parts:
+            if x1 - x0 < 2:
+                continue
+            line = QPainterPath()
+            xs = [x0 + i for i in range(int(x1 - x0) + 1)] + [x1]
+            for i, xi in enumerate(xs):
+                pt = QPointF(left + xi, y_at(xi))
+                line.moveTo(pt) if i == 0 else line.lineTo(pt)
+            fill = QPainterPath(line)
+            fill.lineTo(left + x1, mid)
+            fill.lineTo(left + x0, mid)
+            fill.closeSubpath()
+
+            def grad(alpha: float, hot: bool = False) -> QLinearGradient:
+                g = QLinearGradient(left + x0, 0, left + x1, 0)
+                for k in range(9):
+                    f = k / 8
+                    age = age0 + (age1 - age0) * f
+                    life = max(0.0, 1.0 - age / sweep_s) ** 1.6
+                    c = teal(alpha * life)
+                    if hot and age < 0.08:  # white-hot just behind the pen
+                        c = QColor(200, 255, 235, int(alpha * life))
+                    g.setColorAt(f, c)
+                return g
+
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(grad(18 + 10 * e)))
+            p.drawPath(fill)
+            p.setBrush(Qt.NoBrush)
+            for width, alpha in ((14, 6), (8, 12), (4, 30)):
+                pen = QPen(QBrush(grad(alpha + 8 * e)), width)
+                pen.setCapStyle(Qt.RoundCap)
+                pen.setJoinStyle(Qt.RoundJoin)
+                p.setPen(pen)
+                p.drawPath(line)
+            core = QPen(QBrush(grad(235, hot=True)), 1.6)
+            core.setCapStyle(Qt.RoundCap)
+            core.setJoinStyle(Qt.RoundJoin)
+            p.setPen(core)
+            p.drawPath(line)
+
+        # Pen head bloom
+        hx, hy = left + pen_x, y_at(pen_x)
+        bloom = QRadialGradient(QPointF(hx, hy), 16)
+        bloom.setColorAt(0.0, QColor(200, 255, 235, 150))
+        bloom.setColorAt(0.25, teal(70))
+        bloom.setColorAt(1.0, teal(0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(bloom))
+        p.drawEllipse(QPointF(hx, hy), 16, 16)
+        p.setBrush(QColor(235, 255, 248, 255))
+        p.drawEllipse(QPointF(hx, hy), 2.2, 2.2)
+
+        # BPM readout with a dot that pulses on each R wave
+        phase = (t / beat_s) % 1.0
+        pulse = math.exp(-(((phase - 0.265) % 1.0) / 0.12))
+        ry = to_y(-10) + 22
+        p.setBrush(teal(60 + 180 * pulse))
+        p.drawEllipse(QPointF(right - 70, ry), 2.5 + 1.5 * pulse, 2.5 + 1.5 * pulse)
+        p.setPen(teal(150))
+        p.setFont(QFont("IBM Plex Mono", 9))
+        p.drawText(QRectF(right - 62, ry - 8, 62, 16), Qt.AlignRight | Qt.AlignVCenter, f"{bpm:.0f} BPM")
 
 
 # ==========================================================
@@ -353,13 +499,11 @@ class MainWindow(QMainWindow):
         left.addSpacing(24)
 
         # Liked song limit
-        left.addWidget(QLabel("SCAN LIKED SONGS LIMIT", objectName="FieldLabel"))
-        self.scope_spin = QSpinBox()
+        self.scope_spin = QSpinBox(objectName="ScopeSpin")
         self.scope_spin.setRange(50, 2000)
         self.scope_spin.setValue(50)
-        self.scope_spin.setObjectName("ScopeSpin")
-        left.addWidget(self.scope_spin)
-        left.addSpacing(12)
+        left.addLayout(self._field_grid([("SCAN LIKED SONGS LIMIT", self.scope_spin)]))
+        left.addSpacing(16)
 
         # Actions
         left.addWidget(QLabel("CURATION ACTIONS", objectName="SectionLabel"))
@@ -373,29 +517,24 @@ class MainWindow(QMainWindow):
         self._add_action_button(left, "VIGNITY PICKS", self.action_generate_vignity_picks)
 
         # GPT SECTION
+        left.addSpacing(16)
         left.addWidget(QLabel("SMART SET: GPT POWERED", objectName="SectionLabel"))
-        left.addSpacing(4)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("GPT MODE", objectName="FieldLabel"))
+        left.addSpacing(8)
 
         self.gpt_mode_select = QComboBox(objectName="GptModeSelect")
+        # A QListView popup honours the stylesheet; the default one is the native macOS menu
+        self.gpt_mode_select.setView(QListView())
         self.gpt_mode_select.addItems(["Balanced", "Mood", "Energy", "Discovery", "Background"])
-        row.addWidget(self.gpt_mode_select)
-        row.addStretch()
-        left.addLayout(row)
-
-        # Playlist count
-        left.addSpacing(4)
-        count_row = QHBoxLayout()
-        count_row.addWidget(QLabel("PLAYLIST COUNT", objectName="FieldLabel"))
 
         self.playlist_count_spin = QSpinBox(objectName="ScopeSpin")
         self.playlist_count_spin.setRange(3, 20)
         self.playlist_count_spin.setValue(7)
-        count_row.addWidget(self.playlist_count_spin)
-        count_row.addStretch()
-        left.addLayout(count_row)
+
+        left.addLayout(self._field_grid([
+            ("GPT MODE", self.gpt_mode_select),
+            ("PLAYLIST COUNT", self.playlist_count_spin),
+        ]))
+        left.addSpacing(12)
 
         self._add_action_button(left, "RUN GPT SMART SETS", self.action_gpt_smart_sets)
 
@@ -441,15 +580,18 @@ class MainWindow(QMainWindow):
     def set_loading(self, loading: bool):
         for b in self.buttons:
             b.setEnabled(not loading)
-        self.gpt_mode_select.setEnabled(not loading)
+        for w in (self.gpt_mode_select, self.scope_spin, self.playlist_count_spin):
+            w.setEnabled(not loading)
 
         if loading:
             self.loader_overlay.show_loader()
+            self.log_view.set_active(True)
             if not self._panels_pulsing:
                 self._panels_pulsing = True
                 self._panel_pulse_timer.start()
         else:
             self.loader_overlay.hide_loader()
+            self.log_view.set_active(False)
             self._panels_pulsing = False
             self._panel_pulse_timer.stop()
             self.apply_styles()
@@ -472,6 +614,20 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self._run_with_loader(handler))
         layout.addWidget(btn)
         self.buttons.append(btn)
+
+    def _field_grid(self, rows) -> QGridLayout:
+        """Label/control rows with a shared label column so controls line up."""
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        for i, (text, control) in enumerate(rows):
+            label = QLabel(text, objectName="FieldLabel")
+            label.setFixedWidth(FIELD_LABEL_WIDTH)
+            control.setFixedWidth(FIELD_WIDTH)
+            grid.addWidget(label, i, 0, Qt.AlignVCenter)
+            grid.addWidget(control, i, 1, Qt.AlignVCenter)
+        grid.setColumnStretch(2, 1)
+        return grid
 
     def _pulse_panels(self):
         if not self._panels_pulsing:
@@ -606,18 +762,79 @@ class MainWindow(QMainWindow):
                 padding: 6px 12px;
                 letter-spacing: 2px;
             }}
-            QSpinBox#ScopeSpin {{
-                background-color: rgba(10,10,10,220);
-                border: 1px solid rgba(255,255,255,35);
-                color: white;
-                padding: 4px 8px;
-            }}
-            QComboBox#GptModeSelect {{
+            QSpinBox#ScopeSpin, QComboBox#GptModeSelect {{
                 background-color: rgba(10,10,10,230);
                 border: 1px solid rgba(255,255,255,35);
                 color: white;
-                padding: 4px 8px;
-                font-size: 10px;
+                padding: 5px 10px;
+                font-size: 11px;
+                min-height: 18px;
+            }}
+            QSpinBox#ScopeSpin:hover, QComboBox#GptModeSelect:hover,
+            QSpinBox#ScopeSpin:focus, QComboBox#GptModeSelect:focus,
+            QComboBox#GptModeSelect:on {{
+                border-color: rgba(120,255,200,160);
+            }}
+            QSpinBox#ScopeSpin:disabled, QComboBox#GptModeSelect:disabled {{
+                color: rgba(255,255,255,0.35);
+            }}
+            QSpinBox#ScopeSpin {{
+                padding-right: 26px;
+            }}
+            QComboBox#GptModeSelect {{
+                combobox-popup: 0;
+            }}
+            QSpinBox#ScopeSpin::up-button, QSpinBox#ScopeSpin::down-button {{
+                subcontrol-origin: border;
+                width: 22px;
+                background: transparent;
+                border-left: 1px solid rgba(255,255,255,35);
+            }}
+            QSpinBox#ScopeSpin::up-button {{
+                subcontrol-position: top right;
+                border-bottom: 1px solid rgba(255,255,255,20);
+            }}
+            QSpinBox#ScopeSpin::down-button {{
+                subcontrol-position: bottom right;
+            }}
+            QSpinBox#ScopeSpin::up-button:hover, QSpinBox#ScopeSpin::down-button:hover {{
+                background: rgba(120,255,200,30);
+            }}
+            QSpinBox#ScopeSpin::up-arrow {{
+                image: url("{CHEVRON_UP}");
+                width: 8px;
+                height: 5px;
+            }}
+            QSpinBox#ScopeSpin::down-arrow, QComboBox#GptModeSelect::down-arrow {{
+                image: url("{CHEVRON_DOWN}");
+                width: 8px;
+                height: 5px;
+            }}
+            QComboBox#GptModeSelect::down-arrow {{
+                width: 10px;
+                height: 6px;
+            }}
+            QComboBox#GptModeSelect::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 26px;
+                border-left: 1px solid rgba(255,255,255,35);
+            }}
+            QComboBox#GptModeSelect QAbstractItemView {{
+                background-color: #0a0a0a;
+                border: 1px solid rgba(120,255,200,120);
+                color: white;
+                outline: 0;
+                padding: 4px 0;
+                selection-background-color: rgba(120,255,200,40);
+                selection-color: white;
+            }}
+            QComboBox#GptModeSelect QAbstractItemView::item {{
+                padding: 6px 10px;
+                min-height: 18px;
+            }}
+            QComboBox#GptModeSelect QAbstractItemView::item:hover {{
+                background-color: rgba(120,255,200,25);
             }}
             """
         )
@@ -630,13 +847,12 @@ def main():
     app = QApplication(sys.argv)
 
     # Optional font loading
-    try:
-        QFontDatabase.addApplicationFont(resource_path("assets", "fonts", "Inter.ttf"))
-        QFontDatabase.addApplicationFont(resource_path("assets", "fonts", "IBMPlexMono.ttf"))
-    except Exception as e:
-        print("Font loading failed:", e)
+    for name in ("Inter.ttf", "IBMPlexMono.ttf"):
+        if QFontDatabase.addApplicationFont(resource_path("assets", "fonts", name)) == -1:
+            print(f"Font loading failed: {name}")
 
-    app.setFont(QFont("Inter", 11))
+    if "Inter" in QFontDatabase.families():
+        app.setFont(QFont("Inter", 11))
 
     win = MainWindow()
     win.show()
